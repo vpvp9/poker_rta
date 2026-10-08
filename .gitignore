@@ -1,6 +1,29 @@
-.venv/
+# Python и кэш
 __pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+
+# Настройки IDE (PyCharm, VS Code)
 .idea/
-*.pt
-test_*.png
+.vscode/
+
+# Картинки, скриншоты и датасеты (не забиваем репозиторий графикой)
 data/raw_screenshots/
+data/dataset_corners/
+*.png
+*.jpg
+*.jpeg
+test_*.png
+
+# Веса и обученные модели (PyTorch и YOLO)
+*.pth
+*.pt
+models/*.pth
+models/*.pt
+
+# Логи и тесты
+*.log
+.pytest_cache/

@@ -3,114 +3,110 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-# Автоматически определяем корень проекта (на 2 уровня выше, чем src/vision/)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_MODEL_PATH = (
-    PROJECT_ROOT / "runs" / "segment" / "train-3" / "weights" / "yolo_seg.pt"
-)
+DEFAULT_MODEL_PATH = PROJECT_ROOT / "models" / "yolo_seg.pt"
 
 
 class VisionParser:
 
     def __init__(self, model_path=DEFAULT_MODEL_PATH):
-        # Преобразуем Path в строку для YOLO
         self.model = YOLO(str(model_path))
 
-    def parse_frame(self, image_input):
-        """Принимает путь к файлу или BGR-массив OpenCV."""
-        # 1. original_img — это массив пикселей изображения (numpy ndarray)
-        if isinstance(image_input, str):
-            original_img = cv2.imread(image_input)
-        else:
-            original_img = image_input
+    def parse_frame(
+        self,
+        image_input,
+        crop_height_ratio=0.60,  # Запас по высоте (масть гарантированно влезает)
+        crop_width_ratio=0.55,  # Запас по ширине
+        padding=3,  # Расширение рамки НАРУЖУ (чтобы ничего не срезать)
+    ):
+        """Принимает путь к файлу (str, Path) или BGR-массив (np.ndarray).
 
-        if original_img is None:
-            print("Ошибка: не удалось загрузить изображение")
+        Возвращает полные и устойчивые вырезы углов с запасом безопасности.
+        """
+        # 1. Проверка и загрузка изображения
+        if isinstance(image_input, (str, Path)):
+            file_path = Path(image_input)
+            if not file_path.exists():
+                print(
+                    f"Ошибка: файл не найден по пути -> {file_path.resolve()}"
+                )
+                return None, None
+            original_img = cv2.imread(str(file_path))
+
+        elif isinstance(image_input, np.ndarray):
+            original_img = image_input
+        else:
+            print(f"Ошибка: неподдерживаемый тип данных -> {type(image_input)}")
             return None, None
 
-        # 2. results — это список результатов детекции/сегментации от YOLO
+        if original_img is None:
+            print("Ошибка: cv2.imread не смог декодировать изображение")
+            return None, None
+
+        img_h, img_w = original_img.shape[:2]
+
+        # 2. Детекция через YOLO
         results = self.model(original_img, verbose=False)
+        detected_cards = []
 
-        # 3. Извлекаем очищенные карты
-        left_card, right_card = extract_hero_cards(results, original_img)
+        # 3. Собираем рамки карт
+        for result in results:
+            if result.boxes is None:
+                continue
 
-        return left_card, right_card
+            for box in result.boxes:
+                cls_id = int(box.cls[0])
+                class_name = result.names[cls_id]
 
+                if "hero_card" in class_name:
+                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+                    detected_cards.append((x1, y1, x2, y2))
 
-def extract_hero_cards(results, original_img):
-    h, w, _ = original_img.shape
-    detected_hero_cards = []
+        # Сортируем карты слева направо по X1
+        detected_cards.sort(key=lambda b: b[0])
 
-    for result in results:
-        if result.masks is None:
-            continue
+        corners = []
 
-        for box, mask in zip(result.boxes, result.masks.data):
-            cls_id = int(box.cls[0])
-            class_name = result.names[cls_id]
+        # 4. Вырезаем углы с запасом безопасности наружу
+        for x1, y1, x2, y2 in detected_cards:
+            box_w = x2 - x1
+            box_h = y2 - y1
 
-            if "hero_card" in class_name:
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-                x_center = (x1 + x2) / 2
+            # Расширяем рамку наружу, защищая границы кадра
+            start_x = max(0, x1 - padding)
+            start_y = max(0, y1 - padding)
 
-                # Маску приводим к размеру исходного кадра
-                mask_np = mask.cpu().numpy()
-                mask_resized = cv2.resize(mask_np, (w, h))
-                binary_mask = (mask_resized > 0.5).astype(np.uint8) * 255
+            # Рассчитываем ширину/высоту угла с учетом запаса
+            corner_w = int(box_w * crop_width_ratio) + padding
+            corner_h = int(box_h * crop_height_ratio) + padding
 
-                detected_hero_cards.append(
-                    {
-                        "x_center": x_center,
-                        "box": (x1, y1, x2, y2),
-                        "mask": binary_mask,
-                    }
-                )
+            end_x = min(img_w, start_x + corner_w)
+            end_y = min(img_h, start_y + corner_h)
 
-    # Сортируем карты слева направо по координате X
-    detected_hero_cards.sort(key=lambda c: c["x_center"])
+            # Точный срез из оригинала
+            corner_crop = original_img[start_y:end_y, start_x:end_x]
+            corners.append(corner_crop)
 
-    left_card_crop = None
-    right_card_crop = None
+        left_corner = corners[0] if len(corners) >= 1 else None
+        right_corner = corners[1] if len(corners) >= 2 else None
 
-    if len(detected_hero_cards) >= 1:
-        left_card_crop = crop_card_with_mask(
-            original_img, detected_hero_cards[0]
-        )
-
-    if len(detected_hero_cards) >= 2:
-        right_card_crop = crop_card_with_mask(
-            original_img, detected_hero_cards[1]
-        )
-
-    return left_card_crop, right_card_crop
+        return left_corner, right_corner
 
 
-def crop_card_with_mask(img, card_data):
-    mask = card_data["mask"]
-    x1, y1, x2, y2 = card_data["box"]
-
-    # Обрезаем маску под размер рамки (bounding box)
-    crop_mask = mask[y1:y2, x1:x2]
-    crop_img = img[y1:y2, x1:x2]
-
-    # Применяем маску: всё вне карты станет чёрным (#000000)
-    cleaned = cv2.bitwise_and(crop_img, crop_img, mask=crop_mask)
-    return cleaned
-
-
-# --- ТЕСТОВЫЙ БЛОК ДЛЯ ЗАПУСКА ФАЙЛА НАПРЯМУЮ ---
+# --- ТЕСТОВЫЙ БЛОК ---
 if __name__ == "__main__":
     parser = VisionParser()
 
-    # Берем один из твоих скриншотов из папки data/raw_screenshots/
-    test_image_path = "data/raw_screenshots/table_1790331089_0.jpg"
+    test_image_path = (
+        PROJECT_ROOT / "data" / "raw_screenshots" / "table_1790331089_0.jpg"
+    )
 
-    left_card, right_card = parser.parse_frame(test_image_path)
+    left_corner, right_corner = parser.parse_frame(test_image_path)
 
-    if left_card is not None:
-        cv2.imwrite("test_left_cleaned.png", left_card)
-        print("Левая карта сохранена в test_left_cleaned.png")
+    if left_corner is not None:
+        cv2.imwrite("test_left_corner.png", left_corner)
+        print("Левый угол сохранен в test_left_corner.png")
 
-    if right_card is not None:
-        cv2.imwrite("test_right_cleaned.png", right_card)
-        print("Правая карта сохранена в test_right_cleaned.png")
+    if right_corner is not None:
+        cv2.imwrite("test_right_corner.png", right_corner)
+        print("Правый угол сохранен в test_right_corner.png")
