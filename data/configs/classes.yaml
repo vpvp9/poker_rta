@@ -1,0 +1,15 @@
+names:
+  0: table_area
+  1: dealer_button
+  2: pot_box
+  3: board_cards_area
+  4: seat_zone
+  5: active_turn_indicator
+  6: hero_hole_cards_area
+  7: opponent_cards_area
+  8: bet_chip_stack
+  9: pot_chip_stack
+  10: action_label_badge
+  11: stack_value_text
+  12: bet_value_text
+  13: pot_value_text
