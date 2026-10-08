@@ -3,3 +3,4 @@ __pycache__/
 .idea/
 *.pt
 test_*.png
+data/raw_screenshots/
