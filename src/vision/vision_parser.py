@@ -1,112 +1,168 @@
+import sys
 from pathlib import Path
 import cv2
 import numpy as np
 from ultralytics import YOLO
 
+# Добавляем корень проекта в системный путь
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_MODEL_PATH = PROJECT_ROOT / "models" / "yolo_seg.pt"
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.vision.position_detector import PositionDetector
+from src.vision.card_recognizer import CardRecognizer
+from src.vision.ocr_parser import OCRParser  # Подключаем наш OCR-парсер
+
+DEFAULT_YOLO_PATH = PROJECT_ROOT / "models" / "yolo.pt"
+DEFAULT_YOLO2_PATH = PROJECT_ROOT / "models" / "yolo2.pt"
+DEFAULT_RECOGNIZER_PATH = PROJECT_ROOT / "models" / "card_recognizer.pth"
 
 
 class VisionParser:
-
-    def __init__(self, model_path=DEFAULT_MODEL_PATH):
-        self.model = YOLO(str(model_path))
-
-    def parse_frame(
-        self,
-        image_input,
-        crop_height_ratio=0.60,  # Запас по высоте (масть гарантированно влезает)
-        crop_width_ratio=0.55,  # Запас по ширине
-        padding=3,  # Расширение рамки НАРУЖУ (чтобы ничего не срезать)
+    def __init__(
+            self,
+            model_path=DEFAULT_YOLO_PATH,
+            yolo2_path=DEFAULT_YOLO2_PATH,
+            recognizer_path=DEFAULT_RECOGNIZER_PATH
     ):
-        """Принимает путь к файлу (str, Path) или BGR-массив (np.ndarray).
+        print("👁️ Инициализация VisionParser и OCR...")
+        self.model = YOLO(str(model_path))
+        self.position_detector = PositionDetector(model_path=yolo2_path)
+        self.card_recognizer = CardRecognizer(model_weights_path=recognizer_path)
+        self.ocr_parser = OCRParser()  # Инициализируем распознаватель текста/цифр
 
-        Возвращает полные и устойчивые вырезы углов с запасом безопасности.
-        """
-        # 1. Проверка и загрузка изображения
+    def _load_image(self, image_input):
         if isinstance(image_input, (str, Path)):
             file_path = Path(image_input)
             if not file_path.exists():
-                print(
-                    f"Ошибка: файл не найден по пути -> {file_path.resolve()}"
-                )
-                return None, None
-            original_img = cv2.imread(str(file_path))
-
+                print(f"❌ Ошибка: файл не найден по пути -> {file_path.resolve()}")
+                return None
+            return cv2.imread(str(file_path))
         elif isinstance(image_input, np.ndarray):
-            original_img = image_input
+            return image_input
         else:
-            print(f"Ошибка: неподдерживаемый тип данных -> {type(image_input)}")
-            return None, None
+            print(f"❌ Ошибка: неподдерживаемый тип данных -> {type(image_input)}")
+            return None
 
-        if original_img is None:
-            print("Ошибка: cv2.imread не смог декодировать изображение")
-            return None, None
-
+    def _crop_and_recognize_cards(self, original_img, card_boxes, crop_h_ratio, crop_w_ratio, padding):
+        """Вспомогательный метод для нарезки уголков и прогона через CardRecognizer."""
         img_h, img_w = original_img.shape[:2]
+        recognized_cards = []
 
-        # 2. Детекция через YOLO
-        results = self.model(original_img, verbose=False)
-        detected_cards = []
+        card_boxes.sort(key=lambda b: b[0])
 
-        # 3. Собираем рамки карт
-        for result in results:
-            if result.boxes is None:
-                continue
-
-            for box in result.boxes:
-                cls_id = int(box.cls[0])
-                class_name = result.names[cls_id]
-
-                if "hero_card" in class_name:
-                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-                    detected_cards.append((x1, y1, x2, y2))
-
-        # Сортируем карты слева направо по X1
-        detected_cards.sort(key=lambda b: b[0])
-
-        corners = []
-
-        # 4. Вырезаем углы с запасом безопасности наружу
-        for x1, y1, x2, y2 in detected_cards:
+        for x1, y1, x2, y2 in card_boxes:
             box_w = x2 - x1
             box_h = y2 - y1
 
-            # Расширяем рамку наружу, защищая границы кадра
             start_x = max(0, x1 - padding)
             start_y = max(0, y1 - padding)
 
-            # Рассчитываем ширину/высоту угла с учетом запаса
-            corner_w = int(box_w * crop_width_ratio) + padding
-            corner_h = int(box_h * crop_height_ratio) + padding
+            corner_w = int(box_w * crop_w_ratio) + padding
+            corner_h = int(box_h * crop_h_ratio) + padding
 
             end_x = min(img_w, start_x + corner_w)
             end_y = min(img_h, start_y + corner_h)
 
-            # Точный срез из оригинала
             corner_crop = original_img[start_y:end_y, start_x:end_x]
-            corners.append(corner_crop)
+            card_name = self.card_recognizer.predict(corner_crop)
+            if card_name:
+                recognized_cards.append(card_name)
 
-        left_corner = corners[0] if len(corners) >= 1 else None
-        right_corner = corners[1] if len(corners) >= 2 else None
+        return recognized_cards
 
-        return left_corner, right_corner
+    def parse_full_state(
+            self,
+            image_input,
+            crop_height_ratio=0.60,
+            crop_width_ratio=0.55,
+            padding=3
+    ):
+        """Главный метод для RTA: возвращает карты, борд, позицию и финансовые данные стола."""
+        original_img = self._load_image(image_input)
+        if original_img is None:
+            return None
+
+        results = self.model(original_img, verbose=False)[0]
+
+        hero_boxes = []
+        board_boxes = []
+        bets_data = []
+        stacks_data = []
+        pot_values = []
+
+        for box in results.boxes:
+            cls_id = int(box.cls[0].item())
+            class_name = results.names[cls_id]
+            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+
+            if class_name in ["left_hero", "right_hero"]:
+                hero_boxes.append((x1, y1, x2, y2))
+            elif class_name == "board_card":
+                board_boxes.append((x1, y1, x2, y2))
+            elif class_name in ["player_bet", "hero_bet"]:
+                # Вырезаем кроп ставки и распознаем число
+                crop = original_img[y1:y2, x1:x2]
+                val = self.ocr_parser.extract_number(crop)
+                if val is not None:
+                    bets_data.append({"box": (x1, y1, x2, y2), "value": val})
+            elif class_name in ["player_stack", "hero_stack"]:
+                # Вырезаем кроп стека
+                crop = original_img[y1:y2, x1:x2]
+                val = self.ocr_parser.extract_number(crop)
+                if val is not None:
+                    stacks_data.append({"box": (x1, y1, x2, y2), "value": val})
+            elif class_name == "pot":
+                # Передаем весь бокс целиком — OCR сам прочтет "Банк: 24 ББ", а наш метод очистит текст до числа 24.0
+                crop = original_img[y1:y2, x1:x2]
+                val = self.ocr_parser.extract_number(crop)
+                if val is not None:
+                    pot_values.append(val)
+
+        # Распознаем карты
+        hero_cards = self._crop_and_recognize_cards(
+            original_img, hero_boxes, crop_height_ratio, crop_width_ratio, padding
+        )
+        board_cards = self._crop_and_recognize_cards(
+            original_img, board_boxes, crop_height_ratio, crop_width_ratio, padding
+        )
+
+        # Определяем позицию
+        position = self.position_detector.detect_position(image_input)
+
+        # Общий банк (берем максимальное или первое успешное распознавание pot)
+        total_pot = pot_values[0] if pot_values else 0.0
+
+        return {
+            "hero_cards": hero_cards,
+            "board_cards": board_cards,
+            "position": position,
+            "pot": total_pot,
+            "bets": bets_data,
+            "stacks": stacks_data
+        }
 
 
 # --- ТЕСТОВЫЙ БЛОК ---
 if __name__ == "__main__":
     parser = VisionParser()
+    screenshots_dir = PROJECT_ROOT / "data" / "raw_screenshots"
 
-    test_image_path = (
-        PROJECT_ROOT / "data" / "raw_screenshots" / "table_1790331089_0.jpg"
-    )
+    test_images = list(screenshots_dir.glob("*.jpg")) + list(screenshots_dir.glob("*.png"))
 
-    left_corner, right_corner = parser.parse_frame(test_image_path)
+    if not test_images:
+        print(f"⚠️ В папке {screenshots_dir} не найдено тестовых изображений!")
+    else:
+        print(f"\n🧪 Запуск полного тест-пайплайна для {len(test_images)} скриншотов:\n" + "=" * 50)
 
-    if left_corner is not None:
-        cv2.imwrite("test_left_corner.png", left_corner)
-        print("Левый угол сохранен в test_left_corner.png")
-
-    if right_corner is not None:
-        cv2.imwrite("test_right_corner.png", right_corner)
-        print("Правый угол сохранен в test_right_corner.png")
+        for img_path in test_images:
+            print(f"📁 Файл: {img_path.name}")
+            state = parser.parse_full_state(img_path)
+            if state:
+                print(f"   ♠️ Карты героя: {state['hero_cards']}")
+                print(f"   🃏 Карты борда: {state['board_cards']}")
+                print(f"   📍 Позиция: {state['position']}")
+                print(f"   💰 Банк (Pot): {state['pot']}")
+                print(f"   🎯 Ставки: {[b['value'] for b in state['bets']]}")
+                print(f"   🧱 Стеки: {[s['value'] for s in state['stacks']]}")
+            print("-" * 50)

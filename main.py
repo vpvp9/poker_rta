@@ -1,56 +1,57 @@
-import os
-import random
-from src.config import DATASET_TRAIN_DIR, DATASET_VALID_DIR
-from src.vision.vision_parser import PokerVisionParser
-from src.vision.pot_ocr import PotOCRReader
-from src.vision.card_recognizer import CardRecognizer
+import sys
+from pathlib import Path
+
+# Добавляем корень проекта в системный путь
+PROJECT_ROOT = Path(__file__).resolve().parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.vision.vision_parser import VisionParser
+from src.logic.game_state_manager import GameStateManager
 
 
-class PokerRTAAssistant:
-    def __init__(self):
-        print("Инициализация RTA-ассистента Maxline...")
-        self.parser = PokerVisionParser()
-        self.pot_reader = PotOCRReader()
-        self.recognizer = CardRecognizer()
-        print("Все модули успешно загружены!\n")
+def main():
+    print("🚀 Запуск RTA Poker Pipeline...")
 
-    def analyze_table_image(self, image_path):
-        if not os.path.exists(image_path):
-            return
+    # 1. Инициализируем компоненты
+    parser = VisionParser()
+    state_manager = GameStateManager()
 
-        parsed_data = self.parser.parse_frame(image_path)
+    # 2. Указываем путь к папке со скриншотами
+    screenshots_dir = PROJECT_ROOT / "data" / "raw_screenshots"
+    if not screenshots_dir.exists():
+        print(f"❌ Ошибка: папка со скриншотами не найдена -> {screenshots_dir}")
+        return
 
-        # Распознавание банка
-        pot_val = 0.0
-        if parsed_data['pot'] is not None:
-            pot_val = self.pot_reader.extract_pot_value(parsed_data['pot'])
+    # Ищем все изображения (.jpg, .png)
+    test_images = sorted(list(screenshots_dir.glob("*.jpg")) + list(screenshots_dir.glob("*.png")))
 
-        # Распознавание карт борда
-        board_cards = []
-        for card_crop in parsed_data['board_cards']:
-            card_name = self.recognizer.recognize_card(card_crop, position='board')
-            board_cards.append(card_name)
+    if not test_images:
+        print(f"⚠️ В папке {screenshots_dir} не найдено тестовых изображений!")
+        return
 
-        # Распознавание карманных карт
-        hero_cards = []
-        hero_crops = parsed_data['hero_cards']
-        for i, card_crop in enumerate(hero_crops):
-            pos = 'hero_left' if (len(hero_crops) == 2 and i == 0) or len(hero_crops) == 1 else 'hero_right'
-            card_name = self.recognizer.recognize_card(card_crop, position=pos)
-            hero_cards.append(card_name)
+    print(f"\n📂 Найдено скриншотов для анализа: {len(test_images)}\n" + "=" * 50)
 
-        print(f"Кадр: {os.path.basename(image_path)} | Банк: {pot_val} ББ | Рука: {hero_cards} | Борд: {board_cards}")
+    # 3. Прогоняем каждый скриншот через пайплайн
+    for img_path in test_images:
+        print(f"\n📸 Обработка файла: {img_path.name}")
+
+        # Шаг А: Зрение считывает сырые данные (карты, позиция, пот, стеки, ставки)
+        raw_vision_data = parser.parse_full_state(img_path)
+
+        if not raw_vision_data:
+            print(f"❌ Не удалось распарсить кадр: {img_path.name}")
+            continue
+
+        # Шаг Б: Менеджер состояния упаковывает это в структурированный объект
+        game_state = state_manager.update_state(raw_vision_data)
+
+        # Шаг В: Выводим красивый отчет по раздаче
+        if game_state:
+            print(game_state.summary())
+
+    print("\n✅ Обработка всех кадров завершена!")
 
 
-if __name__ == '__main__':
-    assistant = PokerRTAAssistant()
-
-    if os.path.exists(DATASET_TRAIN_DIR):
-        files = [f for f in os.listdir(DATASET_TRAIN_DIR) if f.endswith('.jpg')]
-        print(f"Найдено скриншотов в TRAIN: {len(files)}")
-        random.shuffle(files)
-
-        # Прогон по первым 100 кадрам
-        for idx, filename in enumerate(files[:100]):
-            sample_file = os.path.join(DATASET_TRAIN_DIR, filename)
-            assistant.analyze_table_image(sample_file)
+if __name__ == "__main__":
+    main()

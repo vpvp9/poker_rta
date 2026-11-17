@@ -90,3 +90,29 @@ class CardRecognizer:
             suit_idx = torch.argmax(suit_logits, dim=1).item()
 
         return f"{RANKS[rank_idx]}{SUITS[suit_idx]}"
+
+    def predict_with_confidence(self, img_crop):
+        """Возвращает строковый код карты и минимальную уверенность (rank/suit)."""
+        if img_crop is None or img_crop.size == 0:
+            return "??", 0.0
+
+        tensor = self.preprocess(img_crop)
+
+        with torch.no_grad():
+            rank_logits, suit_logits = self.model(tensor)
+
+            # Переводим логиты в вероятности (Softmax)
+            rank_probs = torch.softmax(rank_logits, dim=1)
+            suit_probs = torch.softmax(suit_logits, dim=1)
+
+            rank_val, rank_idx = torch.max(rank_probs, dim=1)
+            suit_val, suit_idx = torch.max(suit_probs, dim=1)
+
+            rank_idx = rank_idx.item()
+            suit_idx = suit_idx.item()
+
+            # Общая уверенность — минимум между уверенностью в ранге и масти
+            confidence = min(rank_val.item(), suit_val.item())
+
+        card_str = f"{RANKS[rank_idx]}{SUITS[suit_idx]}"
+        return card_str, confidence
